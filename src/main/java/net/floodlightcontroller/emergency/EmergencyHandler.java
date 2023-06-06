@@ -5,30 +5,19 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
-import org.projectfloodlight.openflow.protocol.OFActionType;
-import org.projectfloodlight.openflow.protocol.OFFactory;
 import org.projectfloodlight.openflow.protocol.OFFlowAdd;
 import org.projectfloodlight.openflow.protocol.OFMessage;
-import org.projectfloodlight.openflow.protocol.OFPacketQueue;
-import org.projectfloodlight.openflow.protocol.OFQueueGetConfigReply;
-import org.projectfloodlight.openflow.protocol.OFQueueGetConfigRequest;
 import org.projectfloodlight.openflow.protocol.OFType;
 import org.projectfloodlight.openflow.protocol.action.OFAction;
 import org.projectfloodlight.openflow.protocol.action.OFActionOutput;
 import org.projectfloodlight.openflow.protocol.action.OFActionSetQueue;
 import org.projectfloodlight.openflow.protocol.match.Match;
 import org.projectfloodlight.openflow.protocol.match.MatchField;
-import org.projectfloodlight.openflow.types.IPv4Address;
+import org.projectfloodlight.openflow.types.IpProtocol;
 import org.projectfloodlight.openflow.types.OFPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import com.google.common.util.concurrent.ListenableFuture;
 
 import net.floodlightcontroller.core.FloodlightContext;
 import net.floodlightcontroller.core.IFloodlightProviderService;
@@ -41,7 +30,10 @@ import net.floodlightcontroller.core.module.IFloodlightService;
 import net.floodlightcontroller.devicemanager.IDevice;
 import net.floodlightcontroller.devicemanager.IDeviceService;
 import net.floodlightcontroller.packet.Ethernet;
+import net.floodlightcontroller.packet.IPacket;
 import net.floodlightcontroller.packet.IPv4;
+import net.floodlightcontroller.packet.TCP;
+import net.floodlightcontroller.packet.UDP;
 import net.floodlightcontroller.routing.IRoutingService;
 import net.floodlightcontroller.routing.Path;
 
@@ -74,29 +66,34 @@ public class EmergencyHandler implements IOFMessageListener, IFloodlightModule {
 		if (!(ethernet.getPayload() instanceof IPv4)) {
 			return Command.CONTINUE;
 		}
-		IPv4Address sourceAddress = ((IPv4) ethernet.getPayload()).getSourceAddress();
+		IPacket ipPayload = (ethernet.getPayload()).getPayload();
 		List<Match> matches = new ArrayList<>();
 		List<OFAction> actions = new ArrayList<>();
 
-		if (sourceAddress.equals(IPv4Address.of("10.0.0.1"))) {
-			log.info("Detected priority flow");
+		if (ipPayload instanceof UDP) {
+			log.info("Detected priority flow UDP");
 			Optional<OFAction> action = getPriorityFlowAction(sw, cntx);
 			if (action.isPresent()) {
 				actions.add(action.get());
 				Match match = sw.getOFFactory()
 						.buildMatch()
-						.setExact(MatchField.IPV4_SRC, sourceAddress)
+						.setExact(MatchField.IP_PROTO, IpProtocol.UDP)
 						.build();
 				matches.add(match);
 			}
-		} else {
-			log.info("Detected non-priority flow");
+		} else if (ipPayload instanceof TCP) {
+			log.info("Detected non-priority flow TCP");
 			OFActionSetQueue setQueueAction = sw.getOFFactory()
 					.actions()
 					.buildSetQueue()
 					.setQueueId(0)
 					.build();
 			actions.add(setQueueAction);
+			Match match = sw.getOFFactory()
+					.buildMatch()
+					.setExact(MatchField.IP_PROTO, IpProtocol.UDP)
+					.build();
+			matches.add(match);
 		}
 
 		if (!actions.isEmpty()) {
