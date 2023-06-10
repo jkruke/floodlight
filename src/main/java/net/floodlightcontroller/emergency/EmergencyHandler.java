@@ -1,11 +1,12 @@
 package net.floodlightcontroller.emergency;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
+import org.projectfloodlight.openflow.protocol.OFFactory;
 import org.projectfloodlight.openflow.protocol.OFFlowAdd;
 import org.projectfloodlight.openflow.protocol.OFMessage;
 import org.projectfloodlight.openflow.protocol.OFType;
@@ -14,6 +15,7 @@ import org.projectfloodlight.openflow.protocol.action.OFActionOutput;
 import org.projectfloodlight.openflow.protocol.action.OFActionSetQueue;
 import org.projectfloodlight.openflow.protocol.match.Match;
 import org.projectfloodlight.openflow.protocol.match.MatchField;
+import org.projectfloodlight.openflow.types.EthType;
 import org.projectfloodlight.openflow.types.IpProtocol;
 import org.projectfloodlight.openflow.types.OFPort;
 import org.slf4j.Logger;
@@ -27,22 +29,17 @@ import net.floodlightcontroller.core.module.FloodlightModuleContext;
 import net.floodlightcontroller.core.module.FloodlightModuleException;
 import net.floodlightcontroller.core.module.IFloodlightModule;
 import net.floodlightcontroller.core.module.IFloodlightService;
-import net.floodlightcontroller.devicemanager.IDevice;
-import net.floodlightcontroller.devicemanager.IDeviceService;
 import net.floodlightcontroller.packet.Ethernet;
 import net.floodlightcontroller.packet.IPacket;
 import net.floodlightcontroller.packet.IPv4;
 import net.floodlightcontroller.packet.TCP;
-import net.floodlightcontroller.packet.UDP;
 import net.floodlightcontroller.routing.IRoutingService;
-import net.floodlightcontroller.routing.Path;
 
 public class EmergencyHandler implements IOFMessageListener, IFloodlightModule {
 
-	private static Logger log = LoggerFactory.getLogger(EmergencyHandler.class);
+	private static final Logger log = LoggerFactory.getLogger(EmergencyHandler.class);
 
 	private IFloodlightProviderService floodlightProvider;
-	private IRoutingService routingEngineService;
 
 	@Override
 	public String getName() {
@@ -67,63 +64,39 @@ public class EmergencyHandler implements IOFMessageListener, IFloodlightModule {
 			return Command.CONTINUE;
 		}
 		IPacket ipPayload = (ethernet.getPayload()).getPayload();
-		List<Match> matches = new ArrayList<>();
-		List<OFAction> actions = new ArrayList<>();
-
-		if (ipPayload instanceof UDP) {
-			log.info("Detected priority flow UDP");
-			Optional<OFAction> action = getPriorityFlowAction(sw, cntx);
-			if (action.isPresent()) {
-				actions.add(action.get());
-				Match match = sw.getOFFactory()
-						.buildMatch()
-						.setExact(MatchField.IP_PROTO, IpProtocol.UDP)
-						.build();
-				matches.add(match);
-			}
-		} else if (ipPayload instanceof TCP) {
-			log.info("Detected non-priority flow TCP");
-			OFActionSetQueue setQueueAction = sw.getOFFactory()
-					.actions()
-					.buildSetQueue()
-					.setQueueId(0)
-					.build();
-			actions.add(setQueueAction);
-			Match match = sw.getOFFactory()
-					.buildMatch()
-					.setExact(MatchField.IP_PROTO, IpProtocol.UDP)
-					.build();
-			matches.add(match);
+		if (!(ipPayload instanceof TCP)) {
+			return Command.CONTINUE;
 		}
 
-		if (!actions.isEmpty()) {
-			OFFlowAdd.Builder flowAddBuilder = sw.getOFFactory()
-					.buildFlowAdd()
-					.setActions(actions);
-			matches.forEach(flowAddBuilder::setMatch);
-			flowAddBuilder.setPriority(10);
-			OFFlowAdd flowAdd = flowAddBuilder.build();
-			sw.write(flowAdd);
-			log.info("Added flow to switch=" + sw + ", flow=" + flowAdd);
-		}
-		return Command.CONTINUE;
-	}
-
-	private Optional<OFAction> getPriorityFlowAction(IOFSwitch sw, FloodlightContext cntx) {
-		IDevice dstDevice = IDeviceService.fcStore.get(cntx, IDeviceService.CONTEXT_DST_DEVICE);
-		Path path = routingEngineService.getPath(sw.getId(), dstDevice.getAttachmentPoints()[0].getNodeId());
-		if (path.getHopCount() == 0) {
-			return Optional.empty();
-		}
-		OFPort outPort = path.getPath()
-				.get(0)
-				.getPortId();
-		OFActionOutput outputAction = sw.getOFFactory()
-				.actions()
-				.buildOutput()
-				.setPort(outPort)
+		OFFactory factory = sw.getOFFactory();
+		OFFlowAdd.Builder flowAddBuilder = factory.buildFlowAdd();
+		log.debug("Detected non-priority flow TCP");
+		Match match = factory.buildMatch()
+				.setExact(MatchField.ETH_TYPE, EthType.IPv4)
+				.setExact(MatchField.IP_PROTO, IpProtocol.TCP)
 				.build();
-		return Optional.of(outputAction);
+		flowAddBuilder.setMatch(match);
+
+		List<OFAction> actions = new ArrayList<>();
+		OFActionSetQueue setQueueAction = factory.actions()
+				.buildSetQueue()
+				.setQueueId(0)
+				.build();
+		actions.add(setQueueAction);
+
+		OFActionOutput outputAction = factory.actions()
+				.buildOutput()
+				.setPort(OFPort.NORMAL)
+				.build();
+		actions.add(outputAction);
+
+		flowAddBuilder.setActions(actions);
+		flowAddBuilder.setPriority(10);
+		flowAddBuilder.setIdleTimeout(0);
+		OFFlowAdd flowAdd = flowAddBuilder.build();
+		sw.write(flowAdd);
+		log.info("Added flow to switch=" + sw + ", flow=" + flowAdd);
+		return Command.STOP;
 	}
 
 	@Override
@@ -138,15 +111,12 @@ public class EmergencyHandler implements IOFMessageListener, IFloodlightModule {
 
 	@Override
 	public Collection<Class<? extends IFloodlightService>> getModuleDependencies() {
-		Collection<Class<? extends IFloodlightService>> l = new ArrayList<>();
-		l.add(IFloodlightProviderService.class);
-		return l;
+		return Arrays.asList(IFloodlightProviderService.class, IRoutingService.class);
 	}
 
 	@Override
 	public void init(FloodlightModuleContext context) throws FloodlightModuleException {
 		floodlightProvider = context.getServiceImpl(IFloodlightProviderService.class);
-		routingEngineService = context.getServiceImpl(IRoutingService.class);
 		log.info("Initialized " + getName());
 	}
 
