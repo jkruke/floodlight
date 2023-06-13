@@ -1,11 +1,17 @@
 package net.floodlightcontroller.emergency;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-
+import net.floodlightcontroller.core.FloodlightContext;
+import net.floodlightcontroller.core.IFloodlightProviderService;
+import net.floodlightcontroller.core.IOFMessageListener;
+import net.floodlightcontroller.core.IOFSwitch;
+import net.floodlightcontroller.core.module.FloodlightModuleContext;
+import net.floodlightcontroller.core.module.FloodlightModuleException;
+import net.floodlightcontroller.core.module.IFloodlightModule;
+import net.floodlightcontroller.core.module.IFloodlightService;
+import net.floodlightcontroller.packet.Ethernet;
+import net.floodlightcontroller.packet.IPv4;
+import net.floodlightcontroller.packet.TCP;
+import net.floodlightcontroller.routing.IRoutingService;
 import org.projectfloodlight.openflow.protocol.OFFactory;
 import org.projectfloodlight.openflow.protocol.OFFlowAdd;
 import org.projectfloodlight.openflow.protocol.OFMessage;
@@ -16,24 +22,13 @@ import org.projectfloodlight.openflow.protocol.action.OFActionSetQueue;
 import org.projectfloodlight.openflow.protocol.match.Match;
 import org.projectfloodlight.openflow.protocol.match.MatchField;
 import org.projectfloodlight.openflow.types.EthType;
+import org.projectfloodlight.openflow.types.IPv4Address;
 import org.projectfloodlight.openflow.types.IpProtocol;
 import org.projectfloodlight.openflow.types.OFPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import net.floodlightcontroller.core.FloodlightContext;
-import net.floodlightcontroller.core.IFloodlightProviderService;
-import net.floodlightcontroller.core.IOFMessageListener;
-import net.floodlightcontroller.core.IOFSwitch;
-import net.floodlightcontroller.core.module.FloodlightModuleContext;
-import net.floodlightcontroller.core.module.FloodlightModuleException;
-import net.floodlightcontroller.core.module.IFloodlightModule;
-import net.floodlightcontroller.core.module.IFloodlightService;
-import net.floodlightcontroller.packet.Ethernet;
-import net.floodlightcontroller.packet.IPacket;
-import net.floodlightcontroller.packet.IPv4;
-import net.floodlightcontroller.packet.TCP;
-import net.floodlightcontroller.routing.IRoutingService;
+import java.util.*;
 
 public class EmergencyHandler implements IOFMessageListener, IFloodlightModule {
 
@@ -63,40 +58,48 @@ public class EmergencyHandler implements IOFMessageListener, IFloodlightModule {
 		if (!(ethernet.getPayload() instanceof IPv4)) {
 			return Command.CONTINUE;
 		}
-		IPacket ipPayload = (ethernet.getPayload()).getPayload();
-		if (!(ipPayload instanceof TCP)) {
+		IPv4 ipPacket = (IPv4) ethernet.getPayload();
+		IPv4Address prioSrc = IPv4Address.of("10.0.0.1");
+		IPv4Address prioDest = IPv4Address.of("10.0.0.4");
+		boolean isPriority = (ipPacket.getSourceAddress().equals(prioSrc) && ipPacket.getDestinationAddress().equals(prioDest))
+				|| (ipPacket.getDestinationAddress().equals(prioSrc) && ipPacket.getSourceAddress().equals(prioDest));
+		if (!((ipPacket.getPayload()) instanceof TCP)) {
 			return Command.CONTINUE;
 		}
+		if (isPriority) {
+			log.debug("Detected priority traffic");
+			return Command.CONTINUE;
+		} else {
+			OFFactory factory = sw.getOFFactory();
+			OFFlowAdd.Builder flowAddBuilder = factory.buildFlowAdd();
+			log.debug("Detected non-priority flow TCP");
+			Match match = factory.buildMatch()
+					.setExact(MatchField.ETH_TYPE, EthType.IPv4)
+					.setExact(MatchField.IP_PROTO, IpProtocol.TCP)
+					.build();
+			flowAddBuilder.setMatch(match);
 
-		OFFactory factory = sw.getOFFactory();
-		OFFlowAdd.Builder flowAddBuilder = factory.buildFlowAdd();
-		log.debug("Detected non-priority flow TCP");
-		Match match = factory.buildMatch()
-				.setExact(MatchField.ETH_TYPE, EthType.IPv4)
-				.setExact(MatchField.IP_PROTO, IpProtocol.TCP)
-				.build();
-		flowAddBuilder.setMatch(match);
+			List<OFAction> actions = new ArrayList<>();
+			OFActionSetQueue setQueueAction = factory.actions()
+					.buildSetQueue()
+					.setQueueId(0)
+					.build();
+			actions.add(setQueueAction);
 
-		List<OFAction> actions = new ArrayList<>();
-		OFActionSetQueue setQueueAction = factory.actions()
-				.buildSetQueue()
-				.setQueueId(0)
-				.build();
-		actions.add(setQueueAction);
+			OFActionOutput outputAction = factory.actions()
+					.buildOutput()
+					.setPort(OFPort.NORMAL)
+					.build();
+			actions.add(outputAction);
 
-		OFActionOutput outputAction = factory.actions()
-				.buildOutput()
-				.setPort(OFPort.NORMAL)
-				.build();
-		actions.add(outputAction);
-
-		flowAddBuilder.setActions(actions);
-		flowAddBuilder.setPriority(10);
-		flowAddBuilder.setIdleTimeout(0);
-		OFFlowAdd flowAdd = flowAddBuilder.build();
-		sw.write(flowAdd);
-		log.info("Added flow to switch=" + sw + ", flow=" + flowAdd);
-		return Command.STOP;
+			flowAddBuilder.setActions(actions);
+			flowAddBuilder.setPriority(10);
+			flowAddBuilder.setIdleTimeout(0);
+			OFFlowAdd flowAdd = flowAddBuilder.build();
+			sw.write(flowAdd);
+			log.info("Added flow to switch=" + sw + ", flow=" + flowAdd);
+			return Command.STOP;
+		}
 	}
 
 	@Override
