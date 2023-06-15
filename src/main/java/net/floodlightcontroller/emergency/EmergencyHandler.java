@@ -8,10 +8,13 @@ import net.floodlightcontroller.core.module.FloodlightModuleContext;
 import net.floodlightcontroller.core.module.FloodlightModuleException;
 import net.floodlightcontroller.core.module.IFloodlightModule;
 import net.floodlightcontroller.core.module.IFloodlightService;
+import net.floodlightcontroller.devicemanager.IDevice;
+import net.floodlightcontroller.devicemanager.IDeviceService;
 import net.floodlightcontroller.packet.Ethernet;
 import net.floodlightcontroller.packet.IPv4;
 import net.floodlightcontroller.packet.TCP;
 import net.floodlightcontroller.routing.IRoutingService;
+import net.floodlightcontroller.routing.Path;
 import org.projectfloodlight.openflow.protocol.OFFactory;
 import org.projectfloodlight.openflow.protocol.OFFlowAdd;
 import org.projectfloodlight.openflow.protocol.OFMessage;
@@ -35,6 +38,8 @@ public class EmergencyHandler implements IOFMessageListener, IFloodlightModule {
 	private static final Logger log = LoggerFactory.getLogger(EmergencyHandler.class);
 
 	private IFloodlightProviderService floodlightProvider;
+	private IRoutingService routingService;
+	private IDeviceService deviceManagerService;
 
 	@Override
 	public String getName() {
@@ -66,40 +71,80 @@ public class EmergencyHandler implements IOFMessageListener, IFloodlightModule {
 		if (!((ipPacket.getPayload()) instanceof TCP)) {
 			return Command.CONTINUE;
 		}
-		if (isPriority) {
-			log.debug("Detected priority traffic");
-			return Command.CONTINUE;
-		} else {
-			OFFactory factory = sw.getOFFactory();
-			OFFlowAdd.Builder flowAddBuilder = factory.buildFlowAdd();
+		if (!isPriority) {
 			log.debug("Detected non-priority flow TCP");
-			Match match = factory.buildMatch()
-					.setExact(MatchField.ETH_TYPE, EthType.IPv4)
-					.setExact(MatchField.IP_PROTO, IpProtocol.TCP)
-					.build();
-			flowAddBuilder.setMatch(match);
+			IDevice dstDevice = getDevice(cntx, ipPacket);
+			if (dstDevice == null) {
+				log.error("Couldn't determine destination device with IP {}", ipPacket.getDestinationAddress());
+				return Command.CONTINUE;
+			}
+			Path path = routingService.getPath(sw.getId(), dstDevice.getAttachmentPoints()[0].getNodeId());
+			if (path.getHopCount() <= 0) {
+				log.debug("No flow entry needed because hops <= 0");
+				return Command.CONTINUE;
+			}
+			OFPort port = path.getPath().get(0).getPortId();
 
-			List<OFAction> actions = new ArrayList<>();
-			OFActionSetQueue setQueueAction = factory.actions()
-					.buildSetQueue()
-					.setQueueId(0)
-					.build();
-			actions.add(setQueueAction);
-
-			OFActionOutput outputAction = factory.actions()
-					.buildOutput()
-					.setPort(OFPort.NORMAL)
-					.build();
-			actions.add(outputAction);
-
-			flowAddBuilder.setActions(actions);
-			flowAddBuilder.setPriority(10);
-			flowAddBuilder.setIdleTimeout(0);
-			OFFlowAdd flowAdd = flowAddBuilder.build();
-			sw.write(flowAdd);
-			log.info("Added flow to switch=" + sw + ", flow=" + flowAdd);
-			return Command.STOP;
+			addNonPriorityFlowEntry(sw, ipPacket.getSourceAddress(), ipPacket.getDestinationAddress(), port);
+		} else {
+			log.debug("Detected priority traffic");
 		}
+		return Command.CONTINUE;
+	}
+
+	private void addNonPriorityFlowEntry(IOFSwitch sw, IPv4Address source, IPv4Address dest, OFPort port) {
+		OFFactory factory = sw.getOFFactory();
+		OFFlowAdd.Builder flowAddBuilder = factory.buildFlowAdd();
+		Match match = factory.buildMatch()
+				.setExact(MatchField.ETH_TYPE, EthType.IPv4)
+				.setExact(MatchField.IP_PROTO, IpProtocol.TCP)
+				.setExact(MatchField.IPV4_SRC, source)
+				.setExact(MatchField.IPV4_DST, dest)
+				.build();
+		flowAddBuilder.setMatch(match);
+		List<OFAction> actions = new ArrayList<>();
+		OFActionSetQueue setQueueAction = factory.actions()
+				.buildSetQueue()
+				.setQueueId(0)
+				.build();
+		actions.add(setQueueAction);
+
+		OFActionOutput outputAction = factory.actions()
+				.buildOutput()
+				.setPort(port)
+				.build();
+		actions.add(outputAction);
+
+		flowAddBuilder.setActions(actions);
+		flowAddBuilder.setPriority(10);
+		flowAddBuilder.setIdleTimeout(0);
+		OFFlowAdd flowAdd = flowAddBuilder.build();
+		sw.write(flowAdd);
+		log.info("Added flow to switch=" + sw + ", flow=" + flowAdd);
+	}
+
+	private IDevice getDevice(FloodlightContext cntx, IPv4 ipPacket) {
+		IDevice dstDevice = IDeviceService.fcStore.get(cntx, IDeviceService.CONTEXT_DST_DEVICE);
+		if (dstDevice == null) {
+			dstDevice = findDeviceByIP(ipPacket.getDestinationAddress());
+		}
+		return dstDevice;
+	}
+
+	private IDevice findDeviceByIP(IPv4Address ip) {
+		// Fetch all known devices
+		Collection<? extends IDevice> allDevices = deviceManagerService.getAllDevices();
+
+		IDevice dstDevice = null;
+		for (IDevice d : allDevices) {
+			for (int i = 0; i < d.getIPv4Addresses().length; ++i) {
+				if (d.getIPv4Addresses()[i].equals(ip)) {
+					dstDevice = d;
+					break;
+				}
+			}
+		}
+		return dstDevice;
 	}
 
 	@Override
@@ -120,6 +165,8 @@ public class EmergencyHandler implements IOFMessageListener, IFloodlightModule {
 	@Override
 	public void init(FloodlightModuleContext context) throws FloodlightModuleException {
 		floodlightProvider = context.getServiceImpl(IFloodlightProviderService.class);
+		routingService = context.getServiceImpl(IRoutingService.class);
+		deviceManagerService = context.getServiceImpl(IDeviceService.class);
 		log.info("Initialized " + getName());
 	}
 
